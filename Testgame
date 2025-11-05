@@ -1,0 +1,212 @@
+import pygame
+import threading
+import random
+import sys
+from evdev import InputDevice, categorize, ecodes, list_devices
+
+# --- Game Configuration ---
+SCREEN_WIDTH = 800
+SCREEN_HEIGHT = 600
+PLAYER_SPEED = 8
+APPLE_SPEED = 5
+TILT_THRESHOLD = 500  # How hard you need to lean to trigger movement. Adjust this!
+
+# Colors
+WHITE = (255, 255, 255)
+BLACK = (0, 0, 0)
+RED = (255, 0, 0)
+GREEN = (0, 150, 0)
+BLUE = (0, 0, 255)
+
+# --- Global Variables for Board Input ---
+# This dictionary will hold the raw weight values from the 4 sensors
+weights = {
+    'TR': 0,  # Top-Right
+    'TL': 0,  # Top-Left
+    'BR': 0,  # Bottom-Right
+    'BL': 0   # Bottom-Left
+}
+# This will be updated by the thread: 0 = stop, -1 = left, 1 = right
+player_direction = 0
+
+
+def find_balance_board():
+    """Finds the Wii Balance Board from the list of input devices."""
+    devices = [InputDevice(path) for path in list_devices()]
+    for device in devices:
+        # The name may vary slightly, but it will contain "Nintendo" and "WBC"
+        if "Nintendo" in device.name and "WBC" in device.name:
+            print(f"Found Balance Board: {device.path}")
+            return device
+    return None
+
+def balance_board_reader(device):
+    """
+    This function runs in a separate thread to constantly read
+    data from the balance board.
+    """
+    global player_direction, weights
+    try:
+        # Get exclusive access to the device
+        device.grab() 
+        print("Balance Board thread started. Step on the board!")
+        for event in device.read_loop():
+            if event.type == ecodes.EV_ABS:
+                # Update the weight for the corresponding sensor
+                if event.code == ecodes.ABS_X:      # Top-Right (TR)
+                    weights['TR'] = event.value
+                elif event.code == ecodes.ABS_RX:   # Top-Left (TL)
+                    weights['TL'] = event.value
+                elif event.code == ecodes.ABS_Y:    # Bottom-Right (BR)
+                    weights['BR'] = event.value
+                elif event.code == ecodes.ABS_RY:   # Bottom-Left (BL)
+                    weights['BL'] = event.value
+                
+                # --- Calculate Tilt ---
+                left_total = weights['TL'] + weights['BL']
+                right_total = weights['TR'] + weights['BR']
+                total_weight = left_total + right_total
+
+                # Only register tilt if there is significant weight on the board
+                if total_weight > 1000: # Adjust if needed
+                    if left_total > right_total + TILT_THRESHOLD:
+                        player_direction = -1  # Go Left
+                    elif right_total > left_total + TILT_THRESHOLD:
+                        player_direction = 1   # Go Right
+                    else:
+                        player_direction = 0   # Stop
+                else:
+                    player_direction = 0 # No one on the board
+                    
+    except Exception as e:
+        print(f"Error reading from balance board: {e}")
+        print("Please ensure you are running this script with 'sudo'")
+        player_direction = 0 # Failsafe
+    finally:
+        device.ungrab()
+
+# --- Pygame Classes ---
+
+class Player(pygame.sprite.Sprite):
+    """The 'basket' controlled by the player."""
+    def __init__(self):
+        super().__init__()
+        self.image = pygame.Surface([80, 20])
+        self.image.fill(BLUE)
+        self.rect = self.image.get_rect()
+        self.rect.x = (SCREEN_WIDTH - self.rect.width) // 2
+        self.rect.y = SCREEN_HEIGHT - 40
+
+    def update(self):
+        """Update the player's position based on the global direction."""
+        self.rect.x += player_direction * PLAYER_SPEED
+        
+        # Keep player on the screen
+        if self.rect.left < 0:
+            self.rect.left = 0
+        if self.rect.right > SCREEN_WIDTH:
+            self.rect.right = SCREEN_WIDTH
+
+class Apple(pygame.sprite.Sprite):
+    """The falling 'apple' to be caught."""
+    def __init__(self):
+        super().__init__()
+        self.image = pygame.Surface([20, 20])
+        self.image.fill(RED)
+        self.rect = self.image.get_rect()
+        self.rect.x = random.randrange(SCREEN_WIDTH - self.rect.width)
+        self.rect.y = random.randrange(-100, -20)
+
+    def update(self):
+        """Move the apple down."""
+        self.rect.y += APPLE_SPEED
+        if self.rect.top > SCREEN_HEIGHT + 10:
+            # Reset to top if it goes off-screen
+            self.rect.x = random.randrange(SCREEN_WIDTH - self.rect.width)
+            self.rect.y = random.randrange(-100, -20)
+
+# --- Main Game Function ---
+
+def main_game():
+    pygame.init()
+    screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+    pygame.display.set_caption("Balance Board Catcher Game")
+    
+    clock = pygame.time.Clock()
+    font = pygame.font.Font(None, 74)
+    
+    all_sprites = pygame.sprite.Group()
+    apple_list = pygame.sprite.Group()
+    
+    player = Player()
+    all_sprites.add(player)
+    
+    for i in range(10):
+        apple = Apple()
+        all_sprites.add(apple)
+        apple_list.add(apple)
+        
+    score = 0
+    running = True
+
+    while running:
+        # --- Event Handling ---
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    running = False
+
+        # --- Game Logic ---
+        all_sprites.update()
+        
+        # Check for collisions
+        apples_hit = pygame.sprite.spritecollide(player, apple_list, True)
+        for apple in apples_hit:
+            score += 1
+            print(f"Score: {score}")
+            # Respawn the apple
+            apple.rect.x = random.randrange(SCREEN_WIDTH - apple.rect.width)
+            apple.rect.y = random.randrange(-100, -20)
+            apple_list.add(apple)
+            all_sprites.add(apple)
+
+        # --- Drawing ---
+        screen.fill(WHITE)
+        all_sprites.draw(screen)
+        
+        # Draw Score
+        score_text = font.render(str(score), True, BLACK)
+        screen.blit(score_text, (10, 10))
+        
+        # Draw tilt direction (for debugging)
+        dir_text = "STOP"
+        if player_direction == -1:
+            dir_text = "LEFT"
+        elif player_direction == 1:
+            dir_text = "RIGHT"
+        debug_text = font.render(dir_text, True, GREEN)
+        screen.blit(debug_text, (SCREEN_WIDTH - 200, 10))
+        
+        pygame.display.flip()
+        clock.tick(60)
+
+    pygame.quit()
+    sys.exit()
+
+# --- Start the Program ---
+if __name__ == "__main__":
+    board = find_balance_board()
+    
+    if board is None:
+        print("No Wii Balance Board found. Make sure it's connected.")
+        sys.exit()
+
+    # Start the balance board reader in its own thread
+    # 'daemon=True' means the thread will close when the main program exits
+    reader_thread = threading.Thread(target=balance_board_reader, args=(board,), daemon=True)
+    reader_thread.start()
+
+    # Run the main game
+    main_game()
